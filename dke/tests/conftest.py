@@ -9,9 +9,9 @@ from backend.db.postgres import Base
 TEST_DATABASE_URL = "postgresql+asyncpg://neondb_owner:npg_cG5dHlVRBZ4m@ep-quiet-wildflower-an81ckms-pooler.c-6.us-east-1.aws.neon.tech/dke_test"
 
 
-@pytest.fixture(scope="session")
+@pytest.fixture(scope="function")
 async def test_engine():
-    eng = create_async_engine(TEST_DATABASE_URL)
+    eng = create_async_engine(TEST_DATABASE_URL, echo=False)
     async with eng.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     yield eng
