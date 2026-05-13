@@ -54,3 +54,9 @@ async def process_bookmark(bookmark_id: UUID, url_or_path: str) -> None:
             bookmark.error = str(e)
 
         await db.commit()
+
+
+async def process_bookmarks_bulk(items: list[tuple[UUID, str]]) -> None:
+    """Process multiple bookmarks sequentially in a single background task."""
+    for bookmark_id, url in items:
+        await process_bookmark(bookmark_id, url)

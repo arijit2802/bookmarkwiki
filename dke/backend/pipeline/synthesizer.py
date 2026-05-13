@@ -1,12 +1,12 @@
 from pathlib import Path
 
-import google.generativeai as genai
+from openai import OpenAI
 
 from backend.config import settings
 from backend.pipeline.extractor import ExtractedContent
 
-genai.configure(api_key=settings.gemini_api_key)
-_model = genai.GenerativeModel("gemini-2.0-flash")
+_client = OpenAI(api_key=settings.groq_api_key, base_url="https://api.groq.com/openai/v1")
+_MODEL = settings.groq_model
 
 _PROMPTS_DIR = Path(__file__).parent.parent / "prompts"
 
@@ -16,7 +16,7 @@ def _load_prompt(name: str) -> str:
 
 
 def synthesize(content: ExtractedContent, existing_node: str | None = None) -> str:
-    """Call Gemini to generate or merge a wiki node. Returns Markdown string."""
+    """Call Groq to generate or merge a wiki node. Returns Markdown string."""
     if existing_node is None:
         template = _load_prompt("synthesize.md")
         prompt = template.replace("{content}", f"{content.title}\n\n{content.text}")
@@ -28,5 +28,8 @@ def synthesize(content: ExtractedContent, existing_node: str | None = None) -> s
             .replace("{new_content}", f"{content.title}\n\n{content.text}")
         )
 
-    response = _model.generate_content(prompt)
-    return response.text
+    response = _client.chat.completions.create(
+        model=_MODEL,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    return response.choices[0].message.content

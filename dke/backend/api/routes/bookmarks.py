@@ -7,7 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.db.postgres import get_db
 from backend.models.bookmark import Bookmark
-from backend.pipeline.processor import process_bookmark
+from backend.pipeline.processor import process_bookmark, process_bookmarks_bulk
 
 router = APIRouter()
 
@@ -48,9 +48,11 @@ async def bulk_create_bookmarks(
         db.add(bm)
         created.append(bm)
     await db.commit()
+    items = []
     for bm in created:
         await db.refresh(bm)
-        background_tasks.add_task(process_bookmark, bm.id, bm.url)
+        items.append((bm.id, bm.url))
+    background_tasks.add_task(process_bookmarks_bulk, items)
     return {"queued": len(created)}
 
 
