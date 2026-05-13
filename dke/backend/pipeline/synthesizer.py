@@ -32,4 +32,4 @@ def synthesize(content: ExtractedContent, existing_node: str | None = None) -> s
         model=_MODEL,
         messages=[{"role": "user", "content": prompt}],
     )
-    return response.choices[0].message.content
+    return response.choices[0].message.content or ""
