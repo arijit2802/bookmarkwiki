@@ -1,28 +1,32 @@
 from typing import AsyncGenerator
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
-
-import backend.models  # noqa: F401 — registers all models with Base
-from backend.db.postgres import Base
-
-TEST_DATABASE_URL = "postgresql+asyncpg://neondb_owner:npg_cG5dHlVRBZ4m@ep-quiet-wildflower-an81ckms-pooler.c-6.us-east-1.aws.neon.tech/dke_test"
-
-
-@pytest.fixture(scope="function")
-async def test_engine():
-    eng = create_async_engine(TEST_DATABASE_URL, echo=False)
-    async with eng.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    yield eng
-    async with eng.begin() as conn:
-        await conn.run_sync(Base.metadata.drop_all)
-    await eng.dispose()
+from sqlalchemy.ext.asyncio import AsyncSession
 
 
 @pytest.fixture
-async def db(test_engine) -> AsyncGenerator[AsyncSession, None]:
-    factory = async_sessionmaker(test_engine, expire_on_commit=False)
-    async with factory() as session:
+async def db() -> AsyncGenerator[AsyncMock, None]:
+    """Mock database session — no live connection needed."""
+    session = AsyncMock(spec=AsyncSession)
+    session.execute.return_value.scalars.return_value.all.return_value = []
+    session.execute.return_value.scalar_one_or_none.return_value = None
+    session.execute.return_value.scalar_one.return_value = MagicMock()
+    yield session
+
+
+@pytest.fixture(autouse=True)
+def _override_get_db():
+    """Override FastAPI's get_db dependency so API tests need no live DB."""
+    from backend.api.main import app
+    from backend.db.postgres import get_db
+
+    async def _mock_get_db():
+        session = AsyncMock(spec=AsyncSession)
+        session.execute.return_value.scalars.return_value.all.return_value = []
+        session.execute.return_value.scalar_one_or_none.return_value = None
         yield session
-        await session.rollback()
+
+    app.dependency_overrides[get_db] = _mock_get_db
+    yield
+    app.dependency_overrides.pop(get_db, None)

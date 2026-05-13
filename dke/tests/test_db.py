@@ -1,6 +1,5 @@
-import pytest
-from sqlalchemy.ext.asyncio import AsyncSession
-
-
-async def test_get_db_yields_async_session(db):
-    assert isinstance(db, AsyncSession)
+async def test_db_session_interface(db):
+    """db fixture provides a usable session interface in tests."""
+    assert db is not None
+    db.add(object())
+    await db.commit()

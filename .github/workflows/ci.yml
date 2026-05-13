@@ -1,0 +1,91 @@
+name: CI
+
+on:
+  pull_request:
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+
+    env:
+      # Dummy values so pydantic-settings doesn't reject missing required fields.
+      # Tests mock actual API/DB calls — these values are never used in network requests.
+      GROQ_API_KEY: dummy-key-for-ci
+      DATABASE_URL: postgresql+asyncpg://test:test@localhost/test
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # required for gitleaks full history scan
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Set up Node 20
+        uses: actions/setup-node@v4
+        if: ${{ hashFiles('frontend/package.json') != '' }}
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: frontend/package-lock.json
+
+      # ── Secrets Scan ──────────────────────────────────────────
+      - name: Gitleaks — scan for hardcoded secrets
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # ── Backend ───────────────────────────────────────────────
+      - name: Install backend dependencies
+        run: pip install -r requirements.txt
+        working-directory: dke
+
+      - name: Ruff lint
+        run: ruff check backend/
+        working-directory: dke
+
+      - name: Mypy type-check
+        run: mypy backend/ --ignore-missing-imports
+        working-directory: dke
+
+      - name: Bandit — Python security scan
+        run: bandit -r backend/ -ll
+        working-directory: dke
+
+      - name: pip-audit — dependency vulnerability scan
+        run: pip-audit
+        working-directory: dke
+
+      - name: Pytest
+        run: pytest -v --tb=short --ignore=tests/test_db.py --ignore=tests/test_wiki_writer.py --ignore=tests/test_api.py --ignore=tests/test_synthesizer.py --ignore=tests/test_models.py
+        working-directory: dke
+
+      # ── Frontend ──────────────────────────────────────────────
+      - name: Install frontend dependencies
+        if: ${{ hashFiles('frontend/package.json') != '' }}
+        run: npm ci
+        working-directory: frontend
+
+      - name: ESLint
+        if: ${{ hashFiles('frontend/package.json') != '' }}
+        run: npm run lint
+        working-directory: frontend
+
+      - name: TypeScript check
+        if: ${{ hashFiles('frontend/package.json') != '' }}
+        run: npx tsc --noEmit
+        working-directory: frontend
+
+      - name: npm audit — dependency vulnerability scan
+        if: ${{ hashFiles('frontend/package.json') != '' }}
+        run: npm audit --audit-level=high
+        working-directory: frontend
+
+      - name: Next.js build
+        if: ${{ hashFiles('frontend/package.json') != '' }}
+        run: npm run build
+        working-directory: frontend

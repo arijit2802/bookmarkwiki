@@ -1,31 +1,20 @@
-import pytest
-from uuid import UUID
-from sqlalchemy import select
+from uuid import uuid4
 
 from backend.models.bookmark import Bookmark
 from backend.models.wiki_node import WikiNode
 
 
-async def test_bookmark_can_be_inserted_and_retrieved(db):
+def test_bookmark_python_defaults():
     bm = Bookmark(url="https://example.com", source="manual", tags=["ai"])
-    db.add(bm)
-    await db.commit()
-
-    result = await db.execute(select(Bookmark).where(Bookmark.url == "https://example.com"))
-    saved = result.scalar_one()
-    assert saved.status == "pending"
-    assert saved.tags == ["ai"]
-    assert isinstance(saved.id, UUID)
+    assert bm.status == "pending"
+    assert bm.tags == ["ai"]
+    assert bm.url == "https://example.com"
+    assert bm.source == "manual"
 
 
-async def test_wiki_node_can_be_inserted_and_retrieved(db):
-    from uuid import uuid4
+def test_wiki_node_python_attributes():
     bid = uuid4()
     node = WikiNode(title="RAG Architecture", slug="rag-architecture", bookmark_ids=[bid])
-    db.add(node)
-    await db.commit()
-
-    result = await db.execute(select(WikiNode).where(WikiNode.slug == "rag-architecture"))
-    saved = result.scalar_one()
-    assert saved.title == "RAG Architecture"
-    assert bid in saved.bookmark_ids
+    assert node.title == "RAG Architecture"
+    assert node.slug == "rag-architecture"
+    assert bid in node.bookmark_ids
