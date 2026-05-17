@@ -4,9 +4,9 @@
 
 **Goal:** After every N successfully processed bookmarks, automatically infer the user's knowledge domain via Groq, generate a full topic taxonomy, identify uncovered topics using pgvector similarity, score gaps by adjacency and link frequency, and generate an ordered learning path with recommended reading.
 
-**Architecture:** `gap_analyzer.py` is a pure async module. A dedicated `analyze_gaps` Celery task runs it. After each bookmark reaches `status=done`, `tasks.py` queries `COUNT(done bookmarks)` — if `count % N == 0`, it dispatches `analyze_gaps`. The gaps route exposes results and manual trigger.
+**Architecture:** `gap_analyzer.py` is a pure async module. After each bookmark reaches `status=done`, `processor.py` inserts a row into `gap_analysis_jobs` (returning immediately). A `gap_analysis_worker` asyncio task — started in FastAPI's lifespan — polls that table every 5 seconds, claims a pending job with `SELECT FOR UPDATE SKIP LOCKED`, and runs `run_gap_analysis(db)`. A unique partial index prevents duplicate concurrent runs. The gaps route exposes results and manual trigger via the same job insert.
 
-**Tech Stack:** Groq `llama-3.3-70b-versatile`, pgvector, sentence-transformers, Celery, SQLAlchemy async
+**Tech Stack:** Groq `llama-3.3-70b-versatile`, pgvector, sentence-transformers, SQLAlchemy async, FastAPI lifespan worker
 
 **Prerequisite:** Phase 0 and Feature 2 plans must be complete.
 
@@ -421,139 +421,186 @@ git commit -m "feat: add gap analyzer with domain inference, coverage mapping, a
 
 ---
 
-### Task 4: Add analyze_gaps Celery task and auto-trigger
+### Task 4: SQL job queue — GapAnalysisJob model, worker, and processor trigger
 
 **Files:**
-- Modify: `backend/tasks/tasks.py`
+- Create: `backend/models/gap_analysis_job.py`
+- Modify: `backend/pipeline/processor.py`
+- Modify: `backend/api/main.py`
 - Create: `tests/test_gap_trigger.py`
 
-- [ ] **Step 1: Write failing test**
+- [ ] **Step 1: Create `gap_analysis_jobs` table on Neon**
 
-```python
-# tests/test_gap_trigger.py
-import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
-from uuid import uuid4
+Connect to Neon and run:
+```sql
+CREATE TABLE IF NOT EXISTS gap_analysis_jobs (
+  id           SERIAL PRIMARY KEY,
+  status       TEXT NOT NULL DEFAULT 'pending',
+  triggered_at TIMESTAMPTZ DEFAULT now(),
+  started_at   TIMESTAMPTZ,
+  completed_at TIMESTAMPTZ,
+  error        TEXT
+);
 
-
-def test_analyze_gaps_task_exists():
-    from backend.tasks.tasks import analyze_gaps_task
-    assert callable(analyze_gaps_task)
-
-
-def test_gap_trigger_dispatches_at_threshold(mocker):
-    """When done bookmark count hits a multiple of threshold, analyze_gaps_task is dispatched."""
-    mock_delay = mocker.patch("backend.tasks.tasks.analyze_gaps_task.delay")
-
-    # Simulate count = 10 (hits threshold of 10)
-    mocker.patch(
-        "backend.tasks.tasks._get_done_count",
-        return_value=10,
-    )
-    from backend.tasks.tasks import _maybe_trigger_gap_analysis
-    import asyncio
-    asyncio.run(_maybe_trigger_gap_analysis())
-
-    mock_delay.assert_called_once()
-
-
-def test_gap_trigger_no_dispatch_below_threshold(mocker):
-    """When done count does not hit threshold, analyze_gaps_task is not dispatched."""
-    mock_delay = mocker.patch("backend.tasks.tasks.analyze_gaps_task.delay")
-    mocker.patch("backend.tasks.tasks._get_done_count", return_value=7)
-
-    from backend.tasks.tasks import _maybe_trigger_gap_analysis
-    import asyncio
-    asyncio.run(_maybe_trigger_gap_analysis())
-
-    mock_delay.assert_not_called()
+CREATE UNIQUE INDEX IF NOT EXISTS gap_jobs_one_active
+  ON gap_analysis_jobs (status)
+  WHERE status IN ('pending', 'running');
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [ ] **Step 2: Write failing tests**
+
+Create `tests/test_gap_trigger.py`:
+```python
+import pytest
+from unittest.mock import AsyncMock, patch
+
+
+def test_gap_analysis_job_model_columns():
+    from backend.models.gap_analysis_job import GapAnalysisJob
+    from sqlalchemy import inspect
+    cols = {c.key for c in inspect(GapAnalysisJob).mapper.column_attrs}
+    assert {"id", "status", "triggered_at", "started_at", "completed_at", "error"} <= cols
+
+
+@pytest.mark.asyncio
+async def test_maybe_trigger_inserts_job_at_threshold(mocker):
+    mock_execute = AsyncMock()
+    mock_db = AsyncMock()
+    mock_db.execute = mock_execute
+    mock_db.commit = AsyncMock()
+
+    from backend.pipeline.processor import _maybe_trigger_gap_analysis
+    await _maybe_trigger_gap_analysis(mock_db, done_count=10, threshold=10)
+
+    mock_execute.assert_called_once()
+    call_text = str(mock_execute.call_args)
+    assert "gap_analysis_jobs" in call_text
+
+
+@pytest.mark.asyncio
+async def test_maybe_trigger_no_insert_below_threshold(mocker):
+    mock_db = AsyncMock()
+
+    from backend.pipeline.processor import _maybe_trigger_gap_analysis
+    await _maybe_trigger_gap_analysis(mock_db, done_count=7, threshold=10)
+
+    mock_db.execute.assert_not_called()
+```
+
+- [ ] **Step 3: Run tests to verify they fail**
 
 ```bash
 .venv/bin/pytest tests/test_gap_trigger.py -v
 ```
 
-Expected: FAIL — `analyze_gaps_task` not found
+Expected: FAIL — `GapAnalysisJob` model and `_maybe_trigger_gap_analysis` don't exist yet
 
-- [ ] **Step 3: Update `backend/tasks/tasks.py`**
+- [ ] **Step 4: Create `backend/models/gap_analysis_job.py`**
+
+```python
+from datetime import datetime
+from sqlalchemy import DateTime, Integer, String, Text
+from sqlalchemy.orm import Mapped, mapped_column
+from backend.db.postgres import Base
+
+
+class GapAnalysisJob(Base):
+    __tablename__ = "gap_analysis_jobs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending")
+    triggered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+```
+
+- [ ] **Step 5: Add `_maybe_trigger_gap_analysis` to `backend/pipeline/processor.py`**
+
+Add this function (call it after marking bookmark `done`):
+```python
+from sqlalchemy import func, select, text
+
+async def _maybe_trigger_gap_analysis(db: AsyncSession, done_count: int, threshold: int) -> None:
+    if threshold > 0 and done_count % threshold == 0:
+        await db.execute(text("""
+            INSERT INTO gap_analysis_jobs (status)
+            VALUES ('pending')
+            ON CONFLICT DO NOTHING
+        """))
+        await db.commit()
+```
+
+In the main `process_bookmark` function, after the bookmark is marked `done`:
+```python
+count_result = await db.execute(
+    select(func.count()).where(Bookmark.status == "done")
+)
+done_count = count_result.scalar() or 0
+await _maybe_trigger_gap_analysis(db, done_count, settings.gap_analysis_threshold)
+```
+
+- [ ] **Step 6: Add `gap_analysis_worker` and wire into lifespan in `backend/api/main.py`**
 
 ```python
 import asyncio
-from uuid import UUID
+import logging
+from sqlalchemy import text
+from backend.db.postgres import async_session_factory
 
-from sqlalchemy import func, select
+logger = logging.getLogger(__name__)
 
-from backend.config import settings
-from backend.tasks.celery_app import celery_app
+async def gap_analysis_worker() -> None:
+    """Poll gap_analysis_jobs every 5s; claim and run one job at a time."""
+    while True:
+        try:
+            async with async_session_factory() as db:
+                result = await db.execute(text("""
+                    UPDATE gap_analysis_jobs
+                    SET status = 'running', started_at = now()
+                    WHERE id = (
+                        SELECT id FROM gap_analysis_jobs
+                        WHERE status = 'pending'
+                        ORDER BY id
+                        LIMIT 1
+                        FOR UPDATE SKIP LOCKED
+                    )
+                    RETURNING id
+                """))
+                job_id = result.scalar_one_or_none()
+                await db.commit()
+
+                if job_id:
+                    try:
+                        from backend.pipeline.gap_analyzer import run_gap_analysis
+                        await run_gap_analysis(db)
+                        await db.execute(text(
+                            "UPDATE gap_analysis_jobs SET status='done', completed_at=now() WHERE id=:id"
+                        ), {"id": job_id})
+                    except Exception as exc:
+                        logger.exception("Gap analysis failed for job %s", job_id)
+                        await db.execute(text(
+                            "UPDATE gap_analysis_jobs SET status='failed', error=:err WHERE id=:id"
+                        ), {"err": str(exc), "id": job_id})
+                    await db.commit()
+        except Exception:
+            logger.exception("gap_analysis_worker error")
+        await asyncio.sleep(5)
 
 
-async def _get_done_count() -> int:
-    from backend.db.postgres import async_session_factory
-    from backend.models.bookmark import Bookmark
-    async with async_session_factory() as db:
-        result = await db.execute(
-            select(func.count()).where(Bookmark.status == "done")
-        )
-        return result.scalar() or 0
-
-
-async def _maybe_trigger_gap_analysis() -> None:
-    count = await _get_done_count()
-    threshold = settings.gap_analysis_threshold
-    if threshold > 0 and count % threshold == 0:
-        analyze_gaps_task.delay()
-
-
-@celery_app.task(bind=True, max_retries=3, default_retry_delay=60)
-def process_bookmark_task(self, bookmark_id: str, url: str) -> None:
-    """Celery task: run full bookmark pipeline, conflict check, gap trigger."""
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await init_db()
+    worker_task = asyncio.create_task(gap_analysis_worker())
+    yield
+    worker_task.cancel()
     try:
-        asyncio.run(_pipeline(bookmark_id, url))
-    except Exception as exc:
-        raise self.retry(exc=exc, countdown=60 * (2 ** self.request.retries))
-
-
-async def _pipeline(bookmark_id: str, url: str) -> None:
-    from sqlalchemy import select
-
-    from backend.db.postgres import async_session_factory
-    from backend.models.wiki_node import WikiNode
-    from backend.pipeline.conflict_engine import run_conflict_check
-    from backend.pipeline.processor import process_bookmark
-
-    node_id = await process_bookmark(UUID(bookmark_id), url)
-    if node_id is None:
-        return
-
-    async with async_session_factory() as db:
-        result = await db.execute(select(WikiNode).where(WikiNode.id == node_id))
-        node = result.scalar_one_or_none()
-        if node and node.summary:
-            await run_conflict_check(db, node_id=node_id, summary=node.summary)
-
-    await _maybe_trigger_gap_analysis()
-
-
-@celery_app.task(bind=True, max_retries=2, default_retry_delay=120)
-def analyze_gaps_task(self) -> None:
-    """Celery task: run full gap analysis pipeline."""
-    try:
-        asyncio.run(_run_gaps())
-    except Exception as exc:
-        raise self.retry(exc=exc, countdown=120 * (2 ** self.request.retries))
-
-
-async def _run_gaps() -> None:
-    from backend.db.postgres import async_session_factory
-    from backend.pipeline.gap_analyzer import run_gap_analysis
-
-    async with async_session_factory() as db:
-        await run_gap_analysis(db)
+        await worker_task
+    except asyncio.CancelledError:
+        pass
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [ ] **Step 7: Run tests to verify they pass**
 
 ```bash
 .venv/bin/pytest tests/test_gap_trigger.py -v
@@ -561,11 +608,11 @@ async def _run_gaps() -> None:
 
 Expected: PASS
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 8: Commit**
 
 ```bash
-git add backend/tasks/tasks.py tests/test_gap_trigger.py
-git commit -m "feat: add analyze_gaps Celery task with auto-trigger after N bookmarks"
+git add backend/models/gap_analysis_job.py backend/pipeline/processor.py backend/api/main.py tests/test_gap_trigger.py
+git commit -m "feat: SQL job queue for gap analysis — GapAnalysisJob model, worker, processor trigger"
 ```
 
 ---
@@ -604,8 +651,9 @@ async def test_fill_gap_not_found():
 
 
 @pytest.mark.asyncio
-async def test_trigger_gap_analysis(mocker):
-    mocker.patch("backend.api.routes.gaps.analyze_gaps_task.delay")
+async def test_trigger_gap_analysis_inserts_job(mocker):
+    mock_execute = mocker.AsyncMock()
+    mocker.patch("backend.api.routes.gaps.AsyncSession.execute", mock_execute)
     from backend.api.main import app
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         resp = await client.post("/gaps/analyze")
@@ -627,12 +675,11 @@ Expected: FAIL — `/gaps` route not found
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.db.postgres import get_db
 from backend.models.gap import Gap
-from backend.tasks.tasks import analyze_gaps_task
 
 router = APIRouter()
 
@@ -660,8 +707,14 @@ async def list_gaps(db: AsyncSession = Depends(get_db)):
 
 
 @router.post("/gaps/analyze")
-async def trigger_gap_analysis():
-    analyze_gaps_task.delay()
+async def trigger_gap_analysis(db: AsyncSession = Depends(get_db)):
+    """Insert a pending job — the background worker picks it up within 5s."""
+    await db.execute(text("""
+        INSERT INTO gap_analysis_jobs (status)
+        VALUES ('pending')
+        ON CONFLICT DO NOTHING
+    """))
+    await db.commit()
     return {"status": "queued"}
 
 
@@ -716,7 +769,7 @@ Expected: All tests pass.
 ```bash
 docker-compose up -d
 .venv/bin/uvicorn backend.api.main:app --reload --port 8000 &
-.venv/bin/celery -A backend.tasks.celery_app worker --loglevel=info &
+# No separate worker needed — gap_analysis_worker starts automatically in FastAPI lifespan
 
 # Submit 10 bookmarks (use varied URLs for good taxonomy)
 curl -s -X POST http://localhost:8000/bookmarks/bulk \
@@ -735,14 +788,17 @@ curl -s -X POST http://localhost:8000/bookmarks/bulk \
   ]}'
 ```
 
-- [ ] **Step 3: Wait and check gaps**
+- [ ] **Step 3: Verify job was picked up and check gaps**
 
 ```bash
-sleep 120
+# Check the job table — should show status='done' within ~10s
+curl -s http://localhost:8000/bookmarks | python3 -m json.tool  # confirm bookmarks done
+
+sleep 10
 curl -s http://localhost:8000/gaps | python3 -m json.tool
 ```
 
-Expected: List of gaps with `topic`, `domain`, `score`, `recommended`, `learning_path`.
+Expected: `gap_analysis_jobs` row transitions `pending → running → done`. Gaps list shows `topic`, `domain`, `score`, `recommended`, `learning_path`.
 
 - [ ] **Step 4: Test manual trigger**
 

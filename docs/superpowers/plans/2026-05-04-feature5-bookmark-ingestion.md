@@ -4,11 +4,11 @@
 
 **Goal:** Add a one-click bookmark save path via a browser bookmarklet (desktop) and mobile share shortcut, both pointing at a new `GET /save` FastAPI endpoint.
 
-**Architecture:** A new `GET /save?url=<encoded>` endpoint validates the URL, creates a Bookmark record in the DB, dispatches a Celery task (Phase 0), and redirects to `/dashboard?saved=true`. The Next.js frontend shows a `SaveToast` after the redirect and provides a `/setup` page with drag-to-bar bookmarklet button and mobile share instructions.
+**Architecture:** A new `GET /save?url=<encoded>` endpoint validates the URL, creates a Bookmark record in the DB, enqueues a FastAPI `BackgroundTask`, and redirects to `/dashboard?saved=true`. The Next.js frontend shows a `SaveToast` after the redirect and provides a `/setup` page with drag-to-bar bookmarklet button and mobile share instructions.
 
-**Tech Stack:** FastAPI, SQLAlchemy async, Celery (Phase 0), Next.js 15 App Router, React, TypeScript, Tailwind CSS, shadcn/ui
+**Tech Stack:** FastAPI, SQLAlchemy async, FastAPI BackgroundTasks (built-in), Next.js 15 App Router, React, TypeScript, Tailwind CSS, shadcn/ui
 
-> **Dependencies:** Phase 0 (Celery + Redis) must be complete before this feature. Feature 4 (Next.js frontend) must be complete before Tasks 3–6.
+> **Dependencies:** Phase 0 (pgvector) must be complete before this feature. Feature 4 (Next.js frontend) must be complete before Tasks 3–6.
 
 ---
 
@@ -98,7 +98,7 @@ Create `tests/test_save.py`:
 ```python
 import pytest
 from httpx import AsyncClient, ASGITransport
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch, AsyncMock
 
 
 @pytest.fixture
@@ -110,9 +110,7 @@ async def client():
 
 
 async def test_save_valid_url_redirects_to_dashboard_saved(client):
-    mock_task = MagicMock()
-    mock_task.delay = MagicMock()
-    with patch("backend.api.routes.save.process_bookmark", mock_task):
+    with patch("backend.api.routes.save.process_bookmark", new_callable=AsyncMock):
         resp = await client.get(
             "/save",
             params={"url": "https://example.com/article"},
@@ -120,7 +118,6 @@ async def test_save_valid_url_redirects_to_dashboard_saved(client):
         )
     assert resp.status_code == 307
     assert resp.headers["location"].endswith("/dashboard?saved=true")
-    mock_task.delay.assert_called_once()
 
 
 async def test_save_invalid_scheme_redirects_to_error(client):
@@ -136,19 +133,6 @@ async def test_save_invalid_scheme_redirects_to_error(client):
 async def test_save_missing_url_param_returns_422(client):
     resp = await client.get("/save")
     assert resp.status_code == 422
-
-
-async def test_save_queue_unavailable_redirects_to_error(client):
-    mock_task = MagicMock()
-    mock_task.delay = MagicMock(side_effect=Exception("Redis down"))
-    with patch("backend.api.routes.save.process_bookmark", mock_task):
-        resp = await client.get(
-            "/save",
-            params={"url": "https://example.com"},
-            follow_redirects=False,
-        )
-    assert resp.status_code == 307
-    assert "error=queue_unavailable" in resp.headers["location"]
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -166,14 +150,14 @@ Create `backend/api/routes/save.py`:
 ```python
 from urllib.parse import urlparse
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, BackgroundTasks, Depends, Query
 from fastapi.responses import RedirectResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.config import settings
 from backend.db.postgres import get_db
 from backend.models.bookmark import Bookmark
-from backend.tasks.tasks import process_bookmark
+from backend.pipeline.processor import process_bookmark
 
 router = APIRouter()
 
@@ -181,6 +165,7 @@ router = APIRouter()
 @router.get("/save")
 async def save_bookmark(
     url: str = Query(...),
+    background_tasks: BackgroundTasks = BackgroundTasks(),
     db: AsyncSession = Depends(get_db),
 ):
     parsed = urlparse(url)
@@ -189,17 +174,11 @@ async def save_bookmark(
             f"{settings.frontend_url}/dashboard?error=invalid_url",
             status_code=307,
         )
-    try:
-        bm = Bookmark(url=url, source="bookmarklet", tags=[])
-        db.add(bm)
-        await db.commit()
-        await db.refresh(bm)
-        process_bookmark.delay(str(bm.id))
-    except Exception:
-        return RedirectResponse(
-            f"{settings.frontend_url}/dashboard?error=queue_unavailable",
-            status_code=307,
-        )
+    bm = Bookmark(url=url, source="bookmarklet", tags=[])
+    db.add(bm)
+    await db.commit()
+    await db.refresh(bm)
+    background_tasks.add_task(process_bookmark, bm.id, bm.url)
     return RedirectResponse(
         f"{settings.frontend_url}/dashboard?saved=true",
         status_code=307,
@@ -559,18 +538,14 @@ git commit -m "feat: mount SaveToast on dashboard for post-save feedback"
 
 ## Task 7: End-to-end verification
 
-- [ ] **Step 1: Start backend + Celery worker + frontend**
+- [ ] **Step 1: Start backend + frontend**
 
 ```bash
 # Terminal 1 — Backend
 cd .worktrees/dke-phase1/dke
 uvicorn backend.api.main:app --host 0.0.0.0 --port 8000 --reload
 
-# Terminal 2 — Celery worker
-cd .worktrees/dke-phase1/dke
-celery -A backend.tasks.celery_app worker --loglevel=info
-
-# Terminal 3 — Frontend
+# Terminal 2 — Frontend
 cd frontend
 npm run dev
 ```
