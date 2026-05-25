@@ -1,6 +1,6 @@
 # DKE Design Spec — Feature 5: Seamless Bookmark Ingestion (Bookmarklet + Mobile Share)
 **Date:** 2026-05-04
-**Status:** Approved
+**Status:** Approved (updated: Celery replaced with FastAPI BackgroundTasks)
 
 ---
 
@@ -36,14 +36,15 @@ GET /save?url=https://some-article.com
         ↓
 FastAPI /save endpoint
   → validate URL (must be http/https)
-  → process_bookmark.delay(url)   ← Celery task (Phase 0)
+  → create Bookmark record in DB
+  → background_tasks.add_task(process_bookmark, ...)   ← FastAPI BackgroundTask
   → redirect to /dashboard?saved=true
         ↓
 Next.js dashboard reads ?saved=true query param
   → shows SaveToast: "Saved! Processing in background..."
 ```
 
-FastAPI and Celery are already in place from Phase 0. The `/save` endpoint is a thin adapter — it does no processing itself.
+The `/save` endpoint is a thin adapter — it does no processing itself. Processing runs as a FastAPI BackgroundTask after the redirect response is sent.
 
 ---
 
@@ -54,25 +55,40 @@ FastAPI and Celery are already in place from Phase 0. The `/save` endpoint is a 
 **File:** `backend/api/routes/save.py`
 
 ```python
-from fastapi import APIRouter, Query
-from fastapi.responses import RedirectResponse
 from urllib.parse import urlparse
-from backend.tasks.tasks import process_bookmark
+
+from fastapi import APIRouter, BackgroundTasks, Depends, Query
+from fastapi.responses import RedirectResponse
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from backend.config import settings
+from backend.db.postgres import get_db
+from backend.models.bookmark import Bookmark
+from backend.pipeline.processor import process_bookmark
 
 router = APIRouter()
 
-FRONTEND_URL = settings.frontend_url  # e.g. http://localhost:3000
-
 @router.get("/save")
-async def save_bookmark(url: str = Query(...)):
+async def save_bookmark(
+    url: str = Query(...),
+    background_tasks: BackgroundTasks = BackgroundTasks(),
+    db: AsyncSession = Depends(get_db),
+):
     parsed = urlparse(url)
     if parsed.scheme not in ("http", "https"):
-        return RedirectResponse(f"{FRONTEND_URL}/dashboard?error=invalid_url")
-    try:
-        process_bookmark.delay(url)
-    except Exception:
-        return RedirectResponse(f"{FRONTEND_URL}/dashboard?error=queue_unavailable")
-    return RedirectResponse(f"{FRONTEND_URL}/dashboard?saved=true")
+        return RedirectResponse(
+            f"{settings.frontend_url}/dashboard?error=invalid_url",
+            status_code=307,
+        )
+    bm = Bookmark(url=url, source="bookmarklet", tags=[])
+    db.add(bm)
+    await db.commit()
+    await db.refresh(bm)
+    background_tasks.add_task(process_bookmark, bm.id, bm.url)
+    return RedirectResponse(
+        f"{settings.frontend_url}/dashboard?saved=true",
+        status_code=307,
+    )
 ```
 
 **Register in** `backend/api/main.py`:
@@ -133,8 +149,7 @@ Toast auto-dismisses after 4 seconds. URL param is cleared with `router.replace(
 |---|---|
 | URL param missing | FastAPI returns `422 Unprocessable Entity` (standard Query validation) |
 | URL is not http/https | Redirect to `/dashboard?error=invalid_url` |
-| Celery/Redis unavailable | Redirect to `/dashboard?error=queue_unavailable` |
-| Duplicate URL | Celery task dispatched; processor skips silently if already `done` |
+| Duplicate URL | BackgroundTask dispatched; processor skips silently if already `done` |
 
 ---
 
@@ -170,6 +185,5 @@ NEXT_PUBLIC_APP_URL=http://localhost:3000   # used to build bookmarklet href
 1. Open any webpage on desktop → click bookmarklet → verify redirect to `/dashboard?saved=true` and toast appears
 2. Verify bookmark appears in DB with `status=queued` then transitions to `done`
 3. Try bookmarklet on `file://` URL → verify redirect to `/dashboard?error=invalid_url`
-4. Stop Redis → click bookmarklet → verify redirect to `/dashboard?error=queue_unavailable`
-5. Follow iOS setup instructions → share a URL from Safari → verify it saves correctly
+4. Follow iOS setup instructions → share a URL from Safari → verify it saves correctly
 6. Visit `/save` with no `url` param → verify 422 response

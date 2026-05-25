@@ -1,6 +1,6 @@
 # DKE Design Spec — Feature 3: Semantic Gap Analyzer
 **Date:** 2026-05-04
-**Status:** Approved
+**Status:** Approved (updated: Celery replaced with SQL job queue + asyncio worker)
 
 ---
 
@@ -19,7 +19,9 @@ The wiki compiler builds knowledge from what the user has already bookmarked, bu
 - Groq generates recommended reading (2-3 search queries per gap) and an ordered learning path
 - Auto-trigger: gap analysis runs automatically after every N successfully processed bookmarks (default N=10, configurable via env var)
 - On-demand trigger: `POST /gaps/analyze`
-- Runs as a dedicated Celery task (dispatched from `processor.py` after threshold check)
+- Auto-trigger inserts a job record into `gap_analysis_jobs` table — decoupled from the bookmark BackgroundTask
+- A lightweight asyncio worker (started at FastAPI lifespan) polls `gap_analysis_jobs` and runs analysis out-of-band
+- `SELECT FOR UPDATE SKIP LOCKED` prevents duplicate concurrent runs even with multiple FastAPI workers
 
 ### Out of scope
 - Industry signal scoring (external RSS/arxiv/trends) — future enhancement
@@ -32,23 +34,29 @@ The wiki compiler builds knowledge from what the user has already bookmarked, bu
 ## 3. Architecture
 
 ```
-processor.py (Celery task)
+processor.py (FastAPI BackgroundTask)
   ├─ extract → synthesize → write wiki node → embed + conflict check  [existing]
   ├─ mark bookmark status=done                                         [existing]
   └─ query COUNT(done bookmarks) — if count % N == 0                  [NEW]
-       └─ dispatch analyze_gaps Celery task                           [NEW]
+       └─ INSERT INTO gap_analysis_jobs (status='pending')            [NEW]
+          ON CONFLICT DO NOTHING  ← deduplication via unique index
 
-analyze_gaps (Celery task in gap_analyzer.py)
-  ├─ collect all wiki node titles + summaries
-  ├─ Groq: infer domain + generate full taxonomy
-  ├─ for each taxonomy topic → pgvector similarity search
-  │    └─ cosine similarity < 0.75 → mark as GAP
-  ├─ score gaps (adjacency + wiki link frequency)
-  ├─ Groq: generate learning path + recommended reading per gap
-  └─ upsert gaps table in PostgreSQL
+gap_analysis_worker (asyncio.create_task in FastAPI lifespan)        [NEW]
+  ├─ poll every 5s
+  ├─ UPDATE gap_analysis_jobs SET status='running'
+  │    WHERE id = (SELECT ... FOR UPDATE SKIP LOCKED)
+  └─ if job claimed → await run_gap_analysis(db)
+       ├─ collect all wiki node titles + summaries
+       ├─ Groq: infer domain + generate full taxonomy
+       ├─ for each taxonomy topic → pgvector similarity search
+       │    └─ cosine similarity < 0.75 → mark as GAP
+       ├─ score gaps (adjacency + wiki link frequency)
+       ├─ Groq: generate learning path + recommended reading per gap
+       ├─ upsert gaps table in PostgreSQL
+       └─ UPDATE gap_analysis_jobs SET status='done' | 'failed'
 ```
 
-No new infrastructure services beyond Celery + Redis (Phase 0). Everything reads from existing `wiki_nodes` and `bookmarks` tables.
+No extra infrastructure. Uses only PostgreSQL (already in place). The bookmark BackgroundTask returns as soon as it inserts the job row — gap analysis runs fully decoupled in the worker loop.
 
 ---
 
@@ -56,21 +64,40 @@ No new infrastructure services beyond Celery + Redis (Phase 0). Everything reads
 
 ### New `gaps` table
 ```sql
-gaps (
+CREATE TABLE gaps (
   id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   topic           TEXT NOT NULL,        -- e.g. "LLM Evaluation Frameworks"
   domain          TEXT NOT NULL,        -- e.g. "LLM Engineering"
   score           FLOAT,                -- 0.0–1.0, higher = higher priority
   score_reasons   JSONB,                -- { "adjacency": 0.8, "link_frequency": 0.6 }
-  recommended     TEXT[],               -- 2-3 search queries / article suggestions
-  learning_path   TEXT[],               -- ordered list of gap topics to tackle before this one
+  recommended     TEXT[] NOT NULL DEFAULT '{}',  -- 2-3 search queries / article suggestions
+  learning_path   TEXT[] NOT NULL DEFAULT '{}',  -- ordered list of gap topics to tackle before this one
   status          TEXT DEFAULT 'open',  -- 'open' | 'filled'
-  created_at      TIMESTAMP DEFAULT now(),
-  updated_at      TIMESTAMP DEFAULT now()
-)
+  created_at      TIMESTAMPTZ DEFAULT now(),
+  updated_at      TIMESTAMPTZ DEFAULT now()
+);
 ```
 
-No changes to existing tables. Gap analysis only reads from `wiki_nodes` and `bookmarks`.
+### New `gap_analysis_jobs` table
+```sql
+CREATE TABLE gap_analysis_jobs (
+  id           SERIAL PRIMARY KEY,
+  status       TEXT NOT NULL DEFAULT 'pending',  -- pending | running | done | failed
+  triggered_at TIMESTAMPTZ DEFAULT now(),
+  started_at   TIMESTAMPTZ,
+  completed_at TIMESTAMPTZ,
+  error        TEXT
+);
+
+-- Prevent queuing a second job while one is already pending or running
+CREATE UNIQUE INDEX gap_jobs_one_active
+  ON gap_analysis_jobs (status)
+  WHERE status IN ('pending', 'running');
+```
+
+The unique partial index is the deduplication mechanism — an `INSERT ... ON CONFLICT DO NOTHING` from `processor.py` is a no-op if a job is already queued or running.
+
+Gap analysis reads from `wiki_nodes` and `bookmarks`. No other table changes.
 
 ---
 
@@ -81,8 +108,21 @@ After each bookmark reaches `status=done`, `processor.py` queries:
 ```sql
 SELECT COUNT(*) FROM bookmarks WHERE status = 'done'
 ```
-If `count % N == 0` → dispatch `analyze_gaps` Celery task.
+If `count % N == 0` → inserts a job row and returns immediately (does not block the bookmark task):
+```python
+await db.execute(text("""
+    INSERT INTO gap_analysis_jobs (status)
+    VALUES ('pending')
+    ON CONFLICT DO NOTHING
+"""))
+await db.commit()
+```
 N is configurable via `GAP_ANALYSIS_THRESHOLD` env var (default: 10).
+
+### Worker
+`gap_analysis_worker()` is an `asyncio.Task` started in FastAPI's lifespan. It polls every 5 seconds, claims one pending job atomically with `SELECT FOR UPDATE SKIP LOCKED`, runs `run_gap_analysis(db)`, then marks the job `done` or `failed`. Because the unique partial index prevents two active jobs, the worker will never run two gap analyses concurrently even with multiple FastAPI processes.
+
+`POST /gaps/analyze` (manual trigger) uses the same `INSERT ... ON CONFLICT DO NOTHING` — the worker picks it up on the next poll.
 
 ### Domain + taxonomy generation prompt (`prompts/taxonomy.md`)
 ```
@@ -159,11 +199,12 @@ PATCH /gaps/{id}/fill        Mark gap as 'filled'
 |---|---|---|
 | `backend/pipeline/gap_analyzer.py` | New | Domain inference, taxonomy generation, coverage mapping, gap scoring, learning path |
 | `backend/models/gap.py` | New | SQLAlchemy Gap model |
-| `backend/api/routes/gaps.py` | New | Gap CRUD endpoints |
+| `backend/models/gap_analysis_job.py` | New | SQLAlchemy GapAnalysisJob model |
+| `backend/api/routes/gaps.py` | New | Gap CRUD endpoints + manual trigger |
+| `backend/api/main.py` | Modified | Start `gap_analysis_worker` as asyncio task in lifespan |
 | `backend/prompts/taxonomy.md` | New | Groq prompt to infer domain + generate taxonomy |
 | `backend/prompts/learning_path.md` | New | Groq prompt to generate ordered learning path + recommended reading |
-| `backend/tasks/celery_app.py` | Modified | Add `analyze_gaps` Celery task |
-| `backend/pipeline/processor.py` | Modified | Add bookmark count check + dispatch `analyze_gaps` |
+| `backend/pipeline/processor.py` | Modified | Add bookmark count check + insert `gap_analysis_jobs` row |
 | `backend/config.py` | Modified | Add `GAP_ANALYSIS_THRESHOLD` env var (default: 10) |
 
 ---
@@ -175,8 +216,9 @@ PATCH /gaps/{id}/fill        Mark gap as 'filled'
 | Embeddings | sentence-transformers `all-MiniLM-L6-v2` (local, CPU) |
 | Vector store | pgvector on Neon PostgreSQL |
 | Domain inference + gap analysis LLM | Groq — `llama-3.3-70b-versatile` |
-| Task execution | Celery (dispatched from processor task) |
-| Task broker | Redis (Upstash free tier in production) |
+| Task queue | PostgreSQL `gap_analysis_jobs` table (no Redis / Celery) |
+| Worker | `asyncio.create_task(gap_analysis_worker())` in FastAPI lifespan |
+| Concurrency control | `SELECT FOR UPDATE SKIP LOCKED` + unique partial index |
 
 ---
 
@@ -190,12 +232,13 @@ GAP_ANALYSIS_THRESHOLD=10   # trigger gap analysis every N processed bookmarks
 
 ## 10. Verification Checklist
 
-1. Process 10 bookmarks on LLM topics → verify `analyze_gaps` Celery task triggered automatically
-2. `GET /gaps` → verify gaps list returned ordered by score descending
-3. Verify gap topics are NOT already covered in `wiki_nodes` (no false positives)
-4. Verify `score_reasons` JSONB contains `adjacency` + `link_frequency` values
-5. Verify `recommended` array contains 2-3 search queries per gap
-6. Verify `learning_path` array is ordered (foundational topics first)
-7. `POST /gaps/analyze` → verify manual trigger works independently
-8. `PATCH /gaps/{id}/fill` → verify status updated to `filled`
-9. Process 20 bookmarks → verify gap analysis triggered at count=10 and count=20 (not both simultaneously)
+1. Process 10 bookmarks → verify a row appears in `gap_analysis_jobs` with `status='pending'`
+2. Wait 5–10s → verify job transitions to `status='done'` (worker picked it up)
+3. `GET /gaps` → verify gaps list returned ordered by score descending
+4. Verify gap topics are NOT already covered in `wiki_nodes` (no false positives)
+5. Verify `score_reasons` JSONB contains `adjacency` + `link_frequency` values
+6. Verify `recommended` array contains 2-3 search queries per gap
+7. Verify `learning_path` array is ordered (foundational topics first)
+8. `POST /gaps/analyze` → verify a new job row is inserted and picked up by the worker
+9. Process bookmarks rapidly near a threshold → verify only one job is queued (deduplication via unique index)
+10. `PATCH /gaps/{id}/fill` → verify status updated to `filled`
